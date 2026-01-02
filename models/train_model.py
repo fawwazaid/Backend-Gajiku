@@ -80,7 +80,7 @@ print(f"Test MAE: {mae:,.0f}")
 # Save model
 # -----------------------------
 os.makedirs("models", exist_ok=True)
-model.save("models/salary_model.h5")
+model.save("outputmodels/salary_model.h5")
 
 print("✅ Model and encoders saved successfully")
 
