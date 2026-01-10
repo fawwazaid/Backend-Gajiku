@@ -1,11 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import tensorflow as tf
-import numpy as np
 import joblib
 import os
+import pandas as pd
+from sklearn.utils.validation import check_is_fitted
 
 # -----------------------------
 # Load environment variables
@@ -16,45 +17,27 @@ HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", 8000))
 
 MODEL_PATH = os.getenv("MODEL_PATH")
-PROVINCE_ENCODER_PATH = os.getenv("PROVINCE_ENCODER")
-EDUCATION_ENCODER_PATH = os.getenv("EDUCATION_ENCODER")
-JOB_ENCODER_PATH = os.getenv("JOB_ENCODER")
+FULL_PIPELINE_PATH = os.getenv("FULL_PIPELINE_PATH")
+SALARY_SCALER_PATH = os.getenv("SALARY_SCALER_PATH")
 
 origins_env = os.getenv("ALLOWED_ORIGINS")
-
-ALLOWED_ORIGINS = (
-    origins_env.split(",")
-    if origins_env
-    else ["*"]  # OK for MVP, restrict later
-)
+ALLOWED_ORIGINS = origins_env.split(",") if origins_env else ["*"]
 
 # -----------------------------
-# Validate required env vars
+# Validate env vars
 # -----------------------------
-if not MODEL_PATH:
-    raise RuntimeError("MODEL_PATH is not set")
-
-if not PROVINCE_ENCODER_PATH:
-    raise RuntimeError("PROVINCE_ENCODER is not set")
-
-if not EDUCATION_ENCODER_PATH:
-    raise RuntimeError("EDUCATION_ENCODER is not set")
-
-if not JOB_ENCODER_PATH:
-    raise RuntimeError("JOB_ENCODER is not set")
+if not all([MODEL_PATH, FULL_PIPELINE_PATH, SALARY_SCALER_PATH]):
+    raise RuntimeError("MODEL_PATH, FULL_PIPELINE_PATH, dan SALARY_SCALER_PATH wajib diatur.")
 
 # -----------------------------
-# Initialize FastAPI app
+# Initialize FastAPI
 # -----------------------------
 app = FastAPI(
     title="Salary Prediction API",
-    description="Predict salary based on user profile",
-    version="1.0.0"
+    description="Predict salary using trained ML pipeline",
+    version="2.0.1"
 )
 
-# -----------------------------
-# Enable CORS
-# -----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -64,13 +47,18 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Load ML model & encoders
+# Load artifacts
 # -----------------------------
-model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+try:
+    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    full_pipeline = joblib.load(FULL_PIPELINE_PATH)
+    salary_scaler = joblib.load(SALARY_SCALER_PATH)
 
-province_encoder = joblib.load(PROVINCE_ENCODER_PATH)
-education_encoder = joblib.load(EDUCATION_ENCODER_PATH)
-job_encoder = joblib.load(JOB_ENCODER_PATH)
+    # Pastikan pipeline sudah fitted
+    check_is_fitted(full_pipeline)
+
+except Exception as e:
+    raise RuntimeError(f"Gagal memuat model atau artifacts: {e}")
 
 # -----------------------------
 # Request schema
@@ -78,9 +66,9 @@ job_encoder = joblib.load(JOB_ENCODER_PATH)
 class SalaryRequest(BaseModel):
     nama: str
     provinsi: str
-    pengalaman: int = Field(ge=0)
     pendidikan: str
     pekerjaan: str
+    pengalaman: int = Field(ge=0)
 
 # -----------------------------
 # Response schema
@@ -95,35 +83,46 @@ class SalaryResponse(BaseModel):
 @app.post("/predict", response_model=SalaryResponse)
 def predict_salary(data: SalaryRequest):
     try:
-        domisili_encoded = province_encoder.transform([data.provinsi])[0]
-        pendidikan_encoded = education_encoder.transform([data.pendidikan])[0]
-        pekerjaan_encoded = job_encoder.transform([data.pekerjaan])[0]
+        # ⚠️ Urutan kolom HARUS SAMA seperti training
+        input_df = pd.DataFrame([{
+            "provinsi": data.provinsi,
+            "pendidikan": data.pendidikan,
+            "pekerjaan": data.pekerjaan,
+            "pengalaman": data.pengalaman
+        }])
 
-        X = np.array([[
-            domisili_encoded,
-            data.pengalaman,
-            pendidikan_encoded,
-            pekerjaan_encoded
-        ]])
+        X_processed = full_pipeline.transform(input_df)
 
-        prediction = model.predict(X, verbose=0)
-        salary = int(prediction[0][0])
+        pred_scaled = model.predict(X_processed, verbose=0)
+        pred_real = salary_scaler.inverse_transform(pred_scaled)[0][0]
+
+        salary = max(0, int(round(pred_real)))
 
         return {
             "nama": data.nama,
             "predicted_salary": salary
         }
 
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Input tidak valid: {ve}"
+        )
+
     except Exception as e:
-        # For MVP, simple error
-        return {
-            "nama": data.nama,
-            "predicted_salary": 0
-        }
+        print("Prediction error:", e)
+        raise HTTPException(
+            status_code=500,
+            detail="Gagal memproses prediksi"
+        )
 
 # -----------------------------
 # Health check
 # -----------------------------
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "model_loaded": True
+    }
+# -----------------------------
